@@ -1,0 +1,237 @@
+//The following script is for using with Amazon Machine Image, and I will be configuring the DB to run in Linux RedHat. We will have to make sure that port 22 is open to ssh the MongoDB Server and port 27017 will need to be opened to communicate with application servers. 
+We will start with SSH into our instance we have created inside of Amazons Machine image//
+
+//install MongoDB
+
+sudo vi /etc/yum.repos.d/mongodb-org-4.0.repo
+
+[mongodb-org-4.0]
+name=MongoDB Repository
+baseurl=https://repo.mongodb.org/yum/amazon/2013.03/mongodb-org/4.0/x86_64/
+gpgcheck=1
+enabled=1
+gpgkey=https://www.mongodb.org/static/pgp/server-4.0.asc
+
+
+
+sudo yum install -y mongodb-org
+sudo service mongod start
+
+sudo chkconfig mongod on
+// ensure the MongoDB will start on reboot. 
+
+
+//Next we start a mongo shell
+mongo 
+//creating an admin user for access control
+
+use admin
+
+
+
+
+db.createUser(
+
+
+ {
+
+
+   user: "admin",
+
+
+   pwd: "changeme",
+
+
+   roles: [ { role: "root", db: "admin" }]
+
+
+ }
+
+
+)
+
+
+
+
+
+
+
+#To check the user name and password
+
+
+db.auth("admin", "changeme")
+
+//to make sure our DB doesn’t allocate more resources than necessary we will disable transparent hugepages first creating the document
+sudo vi /etc/init.d/disable-transparent-hugepage
+//next filling the document with the necessary code to disable the hugepages
+
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          disable-transparent-hugepages
+# Required-Start:    $local_fs
+# Required-Stop:
+# X-Start-Before:    mongod mongodb-mms-automation-agent
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Disable Linux transparent huge pages
+# Description:       Disable Linux transparent huge pages, to improve
+#                    database performance.
+### END INIT INFO
+
+case $1 in
+  start)
+    if [ -d /sys/kernel/mm/transparent_hugepage ]; then
+      thp_path=/sys/kernel/mm/transparent_hugepage
+    elif [ -d /sys/kernel/mm/redhat_transparent_hugepage ]; then
+      thp_path=/sys/kernel/mm/redhat_transparent_hugepage
+    else
+      return 0
+    fi
+
+    echo 'never' > ${thp_path}/enabled
+    echo 'never' > ${thp_path}/defrag
+
+    re='^[0-1]+$'
+    if [[ $(cat ${thp_path}/khugepaged/defrag) =~ $re ]]
+    then
+      # RHEL 7
+      echo 0  > ${thp_path}/khugepaged/defrag
+    else
+      # RHEL 6
+      echo 'no' > ${thp_path}/khugepaged/defrag
+    fi
+
+    unset re
+    unset thp_path
+    ;;
+esac
+//ensure the script can be used
+sudo chmod 755 /etc/init.d/disable-transparent-hugepages
+//now we need to update the Mongo.config file. First open the file, then the following code will be entered into it
+
+processManagement:
+  fork: true  # fork and run in background
+  pidFilePath: /var/run/mongodb/mongod.pid  # location of pidfile
+  timeZoneInfo: /usr/share/zoneinfo
+
+# network interfaces
+net:
+  port: 27017
+  bindIp: mongo.domain.com  # This must be changed as per the private ip of the ec2 Instance Ex: mongo1.domain.com, mongo2.domain.com, 
+  #Enter 0.0.0.0,:: to bind to all IPv4 and IPv6 addresses or, alternatively, use the net.bindIpAll setting.
+  ssl:
+    mode: requireSSL
+    PEMKeyFile: /etc/ssl/mongo_ssl/mongodb.pem
+    CAFile: /etc/ssl/mongo_ssl/CA.pem
+storage:
+  journal:
+    enabled: true
+  engine: wiredTiger
+  wiredTiger:
+    collectionConfig:
+      blockCompressor: none
+security:
+  authorization: enabled #this is for user and psw set on admin db
+  keyFile: /var/lib/mongo/rsetkey #This authenticates the communication between replica members
+replication:
+  replSetName: Replica-set-name #This must be same in all mongod.conf file in replica mongo servers
+--enableFreeMonitoring On
+
+
+
+//next we need to setup the resetkey.file
+
+
+sudo openssl rand -base64 756 > /var/lib/mongo/rsetkey
+sudo chmod 400 /var/lib/mongo/rsetkey
+sudo chown mongod:mongod /var/lib/mongo/rsetkey
+
+
+//next we will setup self-signed SSL using OpenSSL
+
+#This generates Certificate Authority(ca.pem), server(mongodb.pem) and a client(mclient.pem) files 
+
+mkdir ~/mongo_ssl
+cd ~/mongo_ssl
+openssl req -out CA.pem -new -x509 -days 365 -keyout CAPrivKey.pem -subj "/C=2 digit country code/ST=state/O=Organisation/CN=*.domain.com/emailAddress=user@domain.com" -nodes
+
+echo "00" > serial_num.srl # two random digits number
+openssl genrsa -out mongodb.key 2048
+openssl req -key mongodb.key -new -out mongodb.req -subj  "/C=2 digit country code/ST=state/O=Organisation/CN=server/CN=*.domain.com/emailAddress=user@domain.com" -nodes
+openssl x509 -req -in mongodb.req -CA CA.pem -CAkey CAPrivKey.pem -CAserial serial_num.srl -out mongodb.crt -days 365
+cat mongodb.key mongodb.crt > mongodb.pem
+openssl verify -CAfile CA.pem mongodb.pem
+
+openssl genrsa -out mclient.key 2048
+openssl req -key mclient.key -new -out mclient.req -subj "/C=2 digit country code/ST=state/O=Organisation/CN=client/emailAddress=user@domain.com" -nodes
+openssl x509 -req -in mclient.req -CA CA.pem -CAkey CAPrivKey.pem -CAserial serial_num.srl -out mclient.crt -days 365
+cat mclient.key mclient.crt > mclient.pem
+openssl verify -CAfile CA.pem mclient.pem
+
+#once everything is completed let's move it to /etc/ssl/ folder
+
+sudo cp -R mongo_ssl /etc/ssl
+cd mongo_ssl
+sudo chown mongod:mongod *
+
+//next copy the above to create two more servers. As they need the same certificates to work together as they will self-assign, primary, secondary and arbiter. The 3 servers will be mongo.domain.net:27017, mongo1.domain.net:27017 and mongo2.domain.net:27017//
+
+
+//now we must SSH into our admin DB
+
+ssh -i /path/my-key-pair.pem my-instance-user-name@my-instance-public-dns-name
+
+//once SSH connects we must enter the following 
+
+mongo -u "admin" -p "changeme" mongo.domain.com/admin --ssl --sslCAFile /etc/ssl/mongo_ssl/CA.pem --sslPEMKeyFile /etc/ssl/mongo_ssl/mclient.pem 
+
+rs.initiate(
+   {
+      _id: "Replica-set-name", #this must be the name there in mongod.conf file
+      members: [
+         { _id: 0, host : "mongo.domain.net:27017" },
+         { _id: 1, host : "mongo1.domain.net:27017" },
+         { _id: 2, host : "mongo2.domain.net:27017", "arbiterOnly": true}
+      ]
+   }
+)
+
+#check the status of replica members
+rs.status()
+
+//For monitoring open a Mongo Shell and enter the following
+
+db.enableFreeMonitoring()
+
+//this will provide you with a URL to use to track your DB in the cloud, since we enabled freemonitoring in our config file,this will work for providing monitoring info on the DB
+
+
+
+//next we will attach the EBS Volume first we will connect to our instance using SSH from before
+
+ ssh -i /path/my-key-pair.pem my-instance-user-name@my-instance-public-dns-name
+
+
+aws ec2 attach-volume --volume-id vol-1234567890abcdef0 --instance-id my-instance-user-name@my-instance-public-dns-name --device /dev/sdf
+
+//following creates a file system on the new volume 
+
+[ec2-user ~]$ sudo mkfs -t xfs /dev/sdf
+
+
+
+
+
+
+
+
+
+
+
+
+
+//Explanation of code:
+The above walks you through setting up the basics of getting MongoDB installed on AWS and inside the EC2. The database is highly available because it runs off 3 separate servers that act as primary, secondary and an arbiter. Resulting in higher up time. The database is secure because we are using open SSL to encrypt data transfers on the Database and the EBS drive is mounted so that the server has volume for storage using the instance of the volume generated. We also used the simplest form of monitoring the Database by enabling Freemonitoring, which will run at startup of the DB and log data to an easy to access URL where we can keep track of our DB and any issues can be inspected. 
+
+Thank you for your time and consideration,I understand I have little knowledge of MongoDB and AWS but I gave it my best shot by finding materials on the web that can help to build the basics of what is necessary for highly available databases. I also understand that this may not be good enough for you to consider me further. 
+//
